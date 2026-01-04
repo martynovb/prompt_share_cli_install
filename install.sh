@@ -1,5 +1,10 @@
 #!/bin/bash
+# We don't need return codes for "$(command)", only stdout is needed.
+# Allow `[[ -n "$(command)" ]]`, `func "$(command)"`, pipes, etc.
+# shellcheck disable=SC2312
+
 set -e
+set -u
 
 # Configuration
 CLI_NAME="prompt-share"
@@ -11,6 +16,15 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+abort() {
+  printf "%s\n" "$@" >&2
+  exit 1
+}
+
+chomp() {
+  printf "%s" "${1/"$'\n'"/}"
+}
 
 # Detect OS and architecture
 detect_platform() {
@@ -84,32 +98,136 @@ prepare_install_dir() {
         if mkdir -p "$dir" 2>/dev/null; then
             echo "Created directory: $dir"
         else
-            echo "${RED}Error: Cannot create directory: $dir${NC}" >&2
             if [ "$os" != "windows" ] && [ "$EUID" -ne 0 ]; then
-                echo "" >&2
-                echo "Try one of the following:" >&2
-                echo "  1. Use a user-writable directory:" >&2
-                echo "     INSTALL_DIR=~/.local/bin bash install.sh" >&2
-                echo "  2. Run with sudo (for system-wide install):" >&2
-                echo "     sudo bash install.sh" >&2
+                abort "$(
+                    cat <<EOABORT
+Cannot create directory: ${dir}
+
+Try one of the following:
+  1. Use a user-writable directory:
+     INSTALL_DIR=~/.local/bin bash install.sh
+  2. Run with sudo (for system-wide install):
+     sudo bash install.sh
+EOABORT
+                )"
+            else
+                abort "Cannot create directory: ${dir}"
             fi
-            exit 1
         fi
     fi
     
     # Check if directory is writable
     if [ ! -w "$dir" ]; then
-        echo "${RED}Error: Directory is not writable: $dir${NC}" >&2
         if [ "$os" != "windows" ] && [ "$EUID" -ne 0 ]; then
-            echo "" >&2
-            echo "Try one of the following:" >&2
-            echo "  1. Use a user-writable directory:" >&2
-            echo "     INSTALL_DIR=~/.local/bin bash install.sh" >&2
-            echo "  2. Run with sudo (for system-wide install):" >&2
-            echo "     sudo bash install.sh" >&2
+            abort "$(
+                cat <<EOABORT
+Directory is not writable: ${dir}
+
+Try one of the following:
+  1. Use a user-writable directory:
+     INSTALL_DIR=~/.local/bin bash install.sh
+  2. Run with sudo (for system-wide install):
+     sudo bash install.sh
+EOABORT
+            )"
+        else
+            abort "Directory is not writable: ${dir}"
         fi
-        exit 1
     fi
+}
+
+# Helper to join command arguments for display
+shell_join() {
+  local arg
+  printf "%s" "$1"
+  shift
+  for arg in "$@"
+  do
+    printf " %s" "${arg// /\ }"
+  done
+}
+
+# Retry function
+retry() {
+  local tries="$1" n="$1" pause=2
+  shift
+  if ! "$@"
+  then
+    while [[ $((--n)) -gt 0 ]]
+    do
+      printf "${YELLOW}Trying again in %d seconds: %s${NC}\n" "${pause}" "$(shell_join "$@")" >&2
+      sleep "${pause}"
+      ((pause *= 2))
+      if "$@"
+      then
+        return
+      fi
+    done
+    abort "$(printf "Failed %d times doing: %s" "${tries}" "$(shell_join "$@")")"
+  fi
+}
+
+# Fetch API response with retry logic
+fetch_api_response() {
+    local api_url="$1"
+    local response=""
+    
+    if command -v curl >/dev/null 2>&1; then
+        response=$(retry 3 curl -sL "${api_url}" 2>/dev/null)
+    elif command -v wget >/dev/null 2>&1; then
+        response=$(retry 3 wget -qO- "${api_url}" 2>/dev/null)
+    else
+        abort "Neither curl nor wget is available. Please install one of them."
+    fi
+    
+    echo "$response"
+}
+
+# Get latest release tag from GitHub
+# This function tries multiple methods to get the latest tag
+get_latest_tag() {
+    local repo=$1
+    
+    # Method 1: Try GitHub Releases API (most reliable for releases)
+    local latest_tag=""
+    local api_url=""
+    local response=""
+    
+    # Try releases/latest endpoint first (this is the most reliable)
+    api_url="https://api.github.com/repos/${repo}/releases/latest"
+    response=$(fetch_api_response "${api_url}")
+    latest_tag=$(echo "$response" | \
+        grep '"tag_name"' | \
+        sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' | \
+        head -1)
+    
+    # If that fails, try getting the latest from all releases
+    if [ -z "$latest_tag" ]; then
+        api_url="https://api.github.com/repos/${repo}/releases"
+        response=$(fetch_api_response "${api_url}")
+        latest_tag=$(echo "$response" | \
+            grep '"tag_name"' | \
+            sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' | \
+            head -1)
+    fi
+    
+    # Method 2: If releases API fails, try Git tags API (fallback)
+    # Note: This doesn't guarantee "latest" by version, just the first tag returned
+    if [ -z "$latest_tag" ]; then
+        api_url="https://api.github.com/repos/${repo}/tags"
+        response=$(fetch_api_response "${api_url}")
+        latest_tag=$(echo "$response" | \
+            grep '"name"' | \
+            sed 's/.*"name": *"\([^"]*\)".*/\1/' | \
+            head -1)
+    fi
+    
+    # Clean up the tag (remove any whitespace)
+    if [ -n "$latest_tag" ]; then
+        latest_tag=$(chomp "$latest_tag")
+    fi
+    
+    echo "$latest_tag"
 }
 
 # Get download URL for GitHub Releases
@@ -123,16 +241,33 @@ get_download_url() {
     fi
     
     if [ -z "$GITHUB_REPO" ]; then
-        echo "${RED}Error: GITHUB_REPO must be set${NC}" >&2
-        echo "For GitHub: GITHUB_REPO=\"username/repo\" bash install.sh" >&2
-        exit 1
+        abort "GITHUB_REPO must be set. For GitHub: GITHUB_REPO=\"username/repo\" bash install.sh"
     fi
     
+    # Resolve "latest" to actual tag name (GitHub doesn't support "latest" in download URLs)
     if [ "$version" = "latest" ]; then
-        local latest_tag=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+' | head -1 || echo "")
-        if [ -n "$latest_tag" ]; then
-            version="$latest_tag"
+        echo "${YELLOW}Fetching latest release version...${NC}" >&2
+        local latest_tag=$(get_latest_tag "$GITHUB_REPO")
+        
+        if [ -z "$latest_tag" ]; then
+            abort "$(
+                cat <<EOABORT
+Failed to fetch latest release version from GitHub.
+
+Possible issues:
+  - Network connectivity problems
+  - GitHub API rate limiting
+  - Repository may not have any releases
+  - Check: https://github.com/${GITHUB_REPO}/releases
+
+You can specify a version explicitly:
+  VERSION=v1.0.0 bash install.sh
+EOABORT
+            )"
         fi
+        
+        version="$latest_tag"
+        echo "${GREEN}Latest version: ${version}${NC}" >&2
     fi
     
     echo "https://github.com/${GITHUB_REPO}/releases/download/${version}/${filename}"
@@ -147,8 +282,7 @@ main() {
     echo "Detected platform: ${platform}"
     
     if [ "$platform" = "unknown-unknown" ] || [ "$(echo $platform | cut -d'-' -f1)" = "unknown" ]; then
-        echo "${RED}Error: Unsupported platform${NC}" >&2
-        exit 1
+        abort "Unsupported platform: $(uname -s) $(uname -m)"
     fi
     
     # Determine install directory
@@ -186,20 +320,22 @@ main() {
             download_success=true
         fi
     else
-        echo "${RED}Error: Neither curl nor wget is installed${NC}" >&2
-        exit 1
+        abort "Neither curl nor wget is installed. Please install one of them."
     fi
     
     if [ "$download_success" = false ]; then
-        echo "${RED}Error: Failed to download binary${NC}" >&2
-        echo "Tried URL: $download_url" >&2
-        echo "" >&2
-        echo "Possible issues:" >&2
-        echo "  - Release version '${VERSION}' does not exist" >&2
-        echo "  - GitHub Releases may not be publicly accessible" >&2
-        echo "  - Check: https://github.com/${GITHUB_REPO}/releases" >&2
-        echo "  - Network connectivity issues" >&2
-        exit 1
+        abort "$(
+            cat <<EOABORT
+Failed to download binary from:
+  ${download_url}
+
+Possible issues:
+  - Release version '${VERSION}' does not exist
+  - GitHub Releases may not be publicly accessible
+  - Check: https://github.com/${GITHUB_REPO}/releases
+  - Network connectivity issues
+EOABORT
+        )"
     fi
     
     # Make executable (skip on Windows)
@@ -256,8 +392,7 @@ main() {
             fi
         fi
     else
-        echo "${RED}Error: Installation verification failed${NC}" >&2
-        exit 1
+        abort "Installation verification failed: ${install_path} was not created."
     fi
 }
 
