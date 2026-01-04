@@ -3,8 +3,7 @@ set -e
 
 # Configuration
 CLI_NAME="prompt-share"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
-GITHUB_REPO="${GITHUB_REPO:-martynovb/prompt_share_cli_install}"  # Default to public install repo
+GITHUB_REPO="${GITHUB_REPO:-martynovb/prompt_share_cli_install}"
 VERSION="${VERSION:-latest}"
 
 # Colors for output
@@ -38,6 +37,81 @@ detect_platform() {
     echo "${os}-${arch}"
 }
 
+# Get default install directory based on platform and permissions
+get_default_install_dir() {
+    local platform=$1
+    local os=$(echo $platform | cut -d'-' -f1)
+    
+    # If user explicitly set INSTALL_DIR, use it
+    if [ -n "$INSTALL_DIR" ]; then
+        echo "$INSTALL_DIR"
+        return
+    fi
+    
+    # For Windows (Git Bash), use ~/bin
+    if [ "$os" = "windows" ]; then
+        if [ -n "$HOME" ]; then
+            echo "$HOME/bin"
+        else
+            echo "/c/Users/$USER/bin"
+        fi
+        return
+    fi
+    
+    # For Linux/macOS, prefer user-local directory (no sudo needed)
+    # This follows XDG Base Directory Specification and common practice
+    if [ -n "$HOME" ]; then
+        local user_bin="$HOME/.local/bin"
+        # Try to create it to check if it's writable
+        if mkdir -p "$user_bin" 2>/dev/null && [ -w "$user_bin" ] 2>/dev/null; then
+            echo "$user_bin"
+            return
+        fi
+    fi
+    
+    # Fallback to /usr/local/bin (requires sudo)
+    echo "/usr/local/bin"
+}
+
+# Check and prepare install directory
+prepare_install_dir() {
+    local dir=$1
+    local platform=$2
+    local os=$(echo $platform | cut -d'-' -f1)
+    
+    # Try to create directory if it doesn't exist
+    if [ ! -d "$dir" ]; then
+        if mkdir -p "$dir" 2>/dev/null; then
+            echo "Created directory: $dir"
+        else
+            echo "${RED}Error: Cannot create directory: $dir${NC}" >&2
+            if [ "$os" != "windows" ] && [ "$EUID" -ne 0 ]; then
+                echo "" >&2
+                echo "Try one of the following:" >&2
+                echo "  1. Use a user-writable directory:" >&2
+                echo "     INSTALL_DIR=~/.local/bin bash install.sh" >&2
+                echo "  2. Run with sudo (for system-wide install):" >&2
+                echo "     sudo bash install.sh" >&2
+            fi
+            exit 1
+        fi
+    fi
+    
+    # Check if directory is writable
+    if [ ! -w "$dir" ]; then
+        echo "${RED}Error: Directory is not writable: $dir${NC}" >&2
+        if [ "$os" != "windows" ] && [ "$EUID" -ne 0 ]; then
+            echo "" >&2
+            echo "Try one of the following:" >&2
+            echo "  1. Use a user-writable directory:" >&2
+            echo "     INSTALL_DIR=~/.local/bin bash install.sh" >&2
+            echo "  2. Run with sudo (for system-wide install):" >&2
+            echo "     sudo bash install.sh" >&2
+        fi
+        exit 1
+    fi
+}
+
 # Get download URL for GitHub Releases
 get_download_url() {
     local platform=$1
@@ -48,8 +122,6 @@ get_download_url() {
         filename="${filename}.exe"
     fi
     
-    # GITHUB_REPO now has a default value, so this check is no longer needed
-    # But we keep it for backward compatibility if someone explicitly sets it to empty
     if [ -z "$GITHUB_REPO" ]; then
         echo "${RED}Error: GITHUB_REPO must be set${NC}" >&2
         echo "For GitHub: GITHUB_REPO=\"username/repo\" bash install.sh" >&2
@@ -57,25 +129,13 @@ get_download_url() {
     fi
     
     if [ "$version" = "latest" ]; then
-        # Get latest release from GitHub API
         local latest_tag=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+' | head -1 || echo "")
         if [ -n "$latest_tag" ]; then
             version="$latest_tag"
         fi
     fi
     
-    # GitHub Releases download URL
     echo "https://github.com/${GITHUB_REPO}/releases/download/${version}/${filename}"
-}
-
-# Check if running as root (for system-wide install)
-check_permissions() {
-    if [ ! -w "$INSTALL_DIR" ] && [ "$EUID" -ne 0 ]; then
-        echo "${YELLOW}Warning: ${INSTALL_DIR} is not writable. You may need to run with sudo.${NC}"
-        echo "Alternatively, set INSTALL_DIR to a writable directory:"
-        echo "  INSTALL_DIR=~/.local/bin bash install.sh"
-        exit 1
-    fi
 }
 
 # Main installation function
@@ -91,11 +151,12 @@ main() {
         exit 1
     fi
     
-    # Check permissions
-    check_permissions
+    # Determine install directory
+    INSTALL_DIR=$(get_default_install_dir "$platform")
+    echo "Install directory: ${INSTALL_DIR}"
     
-    # Create install directory if it doesn't exist
-    mkdir -p "$INSTALL_DIR"
+    # Prepare install directory (create if needed, check permissions)
+    prepare_install_dir "$INSTALL_DIR" "$platform"
     
     # Get download URL
     local download_url=$(get_download_url "$platform" "$VERSION")
@@ -107,7 +168,8 @@ main() {
     
     # Download binary
     local output_file="${temp_dir}/${CLI_NAME}"
-    if [ "$(echo $platform | cut -d'-' -f1)" = "windows" ]; then
+    local os=$(echo $platform | cut -d'-' -f1)
+    if [ "$os" = "windows" ]; then
         output_file="${output_file}.exe"
     fi
     
@@ -140,16 +202,25 @@ main() {
         exit 1
     fi
     
-    # Make executable
-    chmod +x "$output_file"
+    # Make executable (skip on Windows)
+    if [ "$os" != "windows" ]; then
+        chmod +x "$output_file"
+    fi
     
     # Install to target directory
     local install_path="${INSTALL_DIR}/${CLI_NAME}"
+    if [ "$os" = "windows" ]; then
+        install_path="${install_path}.exe"
+    fi
     echo "Installing to: ${install_path}"
     mv "$output_file" "$install_path"
     
     # Verify installation
-    if [ -f "$install_path" ] && [ -x "$install_path" ]; then
+    if [ -f "$install_path" ]; then
+        if [ "$os" != "windows" ]; then
+            [ -x "$install_path" ] || chmod +x "$install_path"
+        fi
+        
         echo "${GREEN}✓ Installation successful!${NC}"
         echo ""
         echo "You can now use '${CLI_NAME}' from anywhere."
@@ -160,8 +231,29 @@ main() {
             echo "${GREEN}✓ ${INSTALL_DIR} is in your PATH${NC}"
         else
             echo "${YELLOW}Warning: ${INSTALL_DIR} is not in your PATH${NC}"
-            echo "Add it to your PATH by adding this line to your shell profile:"
-            echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+            echo ""
+            if [ "$os" = "windows" ]; then
+                echo "Add it to your PATH by adding this line to your ~/.bashrc or ~/.bash_profile:"
+                echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+            else
+                local shell_profile=""
+                if [ -f "$HOME/.zshrc" ]; then
+                    shell_profile="$HOME/.zshrc"
+                elif [ -f "$HOME/.bashrc" ]; then
+                    shell_profile="$HOME/.bashrc"
+                elif [ -f "$HOME/.bash_profile" ]; then
+                    shell_profile="$HOME/.bash_profile"
+                fi
+                
+                if [ -n "$shell_profile" ]; then
+                    echo "Add it to your PATH by running:"
+                    echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> $shell_profile"
+                    echo "  source $shell_profile"
+                else
+                    echo "Add it to your PATH by adding this line to your shell profile:"
+                    echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+                fi
+            fi
         fi
     else
         echo "${RED}Error: Installation verification failed${NC}" >&2
@@ -171,4 +263,3 @@ main() {
 
 # Run main function
 main "$@"
-
