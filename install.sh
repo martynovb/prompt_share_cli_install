@@ -57,8 +57,8 @@ get_default_install_dir() {
     local os=$(echo $platform | cut -d'-' -f1)
     
     # If user explicitly set INSTALL_DIR, use it
-    if [ -n "$INSTALL_DIR" ]; then
-        echo "$INSTALL_DIR"
+    if [ -n "${INSTALL_DIR+x}" ] && [ -n "${INSTALL_DIR}" ]; then
+        echo "${INSTALL_DIR}"
         return
     fi
     
